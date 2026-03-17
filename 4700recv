@@ -1,0 +1,95 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+        self.exp_seq = 0
+        self.buffer = {}
+
+        self.remote_host = None
+        self.remote_port = None
+
+    def send(self, message):
+        self.log("Sent message %s" % json.dumps(message))
+        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.remote_host, self.remote_port))
+
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Grab the remote host/port if we don't already have it
+        if self.remote_host is None:
+            self.remote_host = addr[0]
+            self.remote_port = addr[1]
+
+        # Make sure we're talking to the same remote host
+        if addr != (self.remote_host, self.remote_port):
+            self.log("Error:  Received response from unexpected remote; ignoring")
+            return None
+        else:
+            self.log("Received message %s" % data.decode("utf-8"))
+            return json.loads(data.decode("utf-8"))
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                msg = self.recv(conn)
+                ack_seq = 0
+
+                if msg:
+                    seq = msg["seq"]
+                    data = msg["data"]
+                    if seq == self.exp_seq:
+                        # Print out the data to stdout
+                        print(data, end='', flush=True)
+                        # In-order packet
+                        self.exp_seq += 1
+
+                        # print out buffered packets now that they are in order
+                        while self.exp_seq in self.buffer:
+                            buff_data = self.buffer.pop(self.exp_seq)
+                            print(buff_data, end='', flush=True)
+                            self.exp_seq += 1
+
+                        # Send back an ack for highest seq we have seen so far
+                        ack_seq = self.exp_seq - 1
+                    elif seq > self.exp_seq:
+                        # Out of order packet
+                        self.log("Error:  Received packet with sequence number %d, expected %d, therefore I am missing a packet" % (msg["seq"], self.exp_seq))
+                        if seq not in self.buffer:
+                            self.buffer[seq] = data
+
+                        # Send back an ack for the missing packet
+                        ack_seq = self.exp_seq - 1
+                    elif msg["seq"] < self.exp_seq:
+                        # Duplicate packet
+                        self.log("Error:  Received packet with sequence number %d, expected %d, therefore I have received a duplicate packet" % (seq, self.exp_seq))
+                        ack_seq = self.exp_seq - 1
+                    else:
+                        self.log("Error:  Received packet with unexpected sequence number %d" % msg["seq"])
+
+                    # If we have no ack to send, send a 0
+                    if ack_seq < 0:
+                        ack_seq = 0
+                    self.send({ "type": "ack", "seq": ack_seq })
+
+                    
+                    
+
+
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

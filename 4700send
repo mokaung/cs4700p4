@@ -1,0 +1,125 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+
+DATA_SIZE = 1375
+
+class Sender:
+    def __init__(self, host, port):
+        self.host = host
+        self.port = int(port)
+        self.log("Sender starting up using port %s" % self.port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.wnd = 2
+        self.lowest_unacked = 0
+        self.seq = 0
+        self.unacked = {}
+        self.eof = False
+        self.last_ack = None
+        self.dup_ack_count = 0
+        self.rto = 1.0
+
+        self.remote_host = None
+        self.remote_port = None
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+    def send(self, message):
+        self.log("Sending message '%s'" % json.dumps(message))
+        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.host, self.port))
+
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+
+        # Grab the remote host/port if we don't already have it
+        if self.remote_host is None:
+            self.remote_host = addr[0]
+            self.remote_port = addr[1]
+
+        # Make sure we're talking to the same remote host
+        if addr != (self.remote_host, self.remote_port):
+            self.log("Error:  Received response from unexpected remote; ignoring")
+            return None
+        else:
+            self.log("Received message %s" % data)
+            return json.loads(data.decode("utf-8"))
+
+    def run(self):
+        
+        while True:
+            sockets = [self.socket, sys.stdin] if not self.eof and self.seq < self.lowest_unacked + self.wnd else [self.socket]
+
+            socks = select.select(sockets, [], [], 0.1)[0]
+            for conn in socks:
+                if conn == self.socket:
+                    data = self.recv(conn)
+
+                    if data:
+                        # all seq numbers before this one are acked
+                        ack_seq = int(data.get("seq"))
+
+                        # track dupe ACKs
+                        if self.last_ack is None or ack_seq != self.last_ack:
+                            self.last_ack = ack_seq
+                            self.dup_ack_count = 0
+                        else:
+                            self.dup_ack_count += 1
+
+                        # fast retransmit: on 3 dupe ACKs for same seq
+                        if self.dup_ack_count >= 3 and self.lowest_unacked in self.unacked:
+                            data, _ = self.unacked[self.lowest_unacked]
+                            msg = { "type": "msg", "data": data, "seq": self.lowest_unacked }
+                            self.send(msg)
+                            # reset timer for this packet and reset dupe count
+                            self.unacked[self.lowest_unacked] = (data, time.time())
+                            self.dup_ack_count = 0
+
+                        # everything <= ack_seq is acknowledged
+                        acked = [s for s in self.unacked.keys() if s <= ack_seq]
+                        # remove all acked seq numbers from before the one we just got
+                        # in our unacked list
+                        for s in acked:
+                            self.unacked.pop(s, None)
+
+                        # update the lowest unacked seq number to the next unacked seq number
+                        if ack_seq + 1 > self.lowest_unacked:
+                            self.lowest_unacked = ack_seq + 1
+                elif conn == sys.stdin:
+                    data = sys.stdin.read(DATA_SIZE)
+                    if len(data) == 0:
+                        self.eof = True
+                        continue
+
+                    msg = { "type": "msg", "data": data, "seq": self.seq }
+                    self.unacked[self.seq] = (data, time.time())
+                    self.send(msg)
+                    self.seq += 1
+
+
+                # fast retransmission, timeout based
+                if self.unacked:
+                    now = time.time()
+                    if self.lowest_unacked in self.unacked:
+                        _, send_time = self.unacked[self.lowest_unacked]
+                        if now - send_time >= self.rto:
+                            # retransmit all unacked packets with seq >= lowest_unacked
+                            for s in sorted(k for k in self.unacked.keys() if k >= self.lowest_unacked):
+                                data, _ = self.unacked[s]
+                                msg = { "type": "msg", "data": data, "seq": s }
+                                self.send(msg)
+                                self.unacked[s] = (data, now)
+                if self.eof and not self.unacked:
+                    self.log("All done!")
+                    sys.exit(0)
+        return
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
