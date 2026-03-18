@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, hashlib
 
 DATA_SIZE = 1375
 
@@ -11,14 +11,21 @@ class Sender:
         self.log("Sender starting up using port %s" % self.port)
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.socket.bind(('0.0.0.0', 0))
-        self.wnd = 2
         self.lowest_unacked = 0
         self.seq = 0
         self.unacked = {}
         self.eof = False
         self.last_ack = None
         self.dup_ack_count = 0
-        self.rto = 1.0
+
+        # congestion window and slow start threshold
+        self.cwnd = 1
+        self.ssthresh = 64
+        self.in_fast_recovery = False
+
+        # RTT estimation for dynamic timeout
+        self.srtt = None
+        self.rto = 1.5
 
         self.remote_host = None
         self.remote_port = None
@@ -27,8 +34,14 @@ class Sender:
         sys.stderr.write(message + "\n")
         sys.stderr.flush()
 
+    def checksum(self, msg):
+        # hash the packet contents so we can detect corruption
+        return hashlib.md5(json.dumps(msg, sort_keys=True).encode("utf-8")).hexdigest()
+
     def send(self, message):
-        self.log("Sending message '%s'" % json.dumps(message))
+        # attach checksum before sending so receiver can verify integrity
+        message["checksum"] = self.checksum(message)
+        self.log("Sending message type=%s seq=%s" % (message.get("type"), message.get("seq")))
         self.socket.sendto(json.dumps(message).encode("utf-8"), (self.host, self.port))
 
     def recv(self, socket):
@@ -44,22 +57,52 @@ class Sender:
             self.log("Error:  Received response from unexpected remote; ignoring")
             return None
         else:
-            self.log("Received message %s" % data)
-            return json.loads(data.decode("utf-8"))
+            self.log("Received message (%d bytes)" % len(data))
+            # try to parse the JSON, drop corrupted packets
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.log("Error:  Received corrupted packet; dropping")
+                return None
+
+            # verify checksum to make sure packet wasnt mangled in transit
+            if "checksum" not in msg:
+                self.log("Error:  Received packet without checksum; dropping")
+                return None
+            received_checksum = msg.pop("checksum")
+            if received_checksum != self.checksum(msg):
+                self.log("Error:  Checksum mismatch on received packet; dropping")
+                return None
+
+            return msg
+
+    def update_rtt(self, send_time):
+        # compute RTT sample and smooth it with EWMA
+        sample = time.time() - send_time
+        if self.srtt is None:
+            self.srtt = sample
+        else:
+            self.srtt = 0.875 * self.srtt + 0.125 * sample
+        # set timeout to 2x smoothed RTT, with a floor so we dont timeout too fast
+        self.rto = max(0.25, 2 * self.srtt)
 
     def run(self):
         
         while True:
-            sockets = [self.socket, sys.stdin] if not self.eof and self.seq < self.lowest_unacked + self.wnd else [self.socket]
+            # only read from stdin if window has room and we havent hit EOF
+            sockets = [self.socket, sys.stdin] if not self.eof and self.seq < self.lowest_unacked + int(self.cwnd) else [self.socket]
 
-            socks = select.select(sockets, [], [], 0.1)[0]
+            socks = select.select(sockets, [], [], 0.05)[0]
             for conn in socks:
                 if conn == self.socket:
                     data = self.recv(conn)
 
                     if data:
+                        # make sure the ack has a seq number, drop if not
+                        if "seq" not in data:
+                            continue
                         # all seq numbers before this one are acked
-                        ack_seq = int(data.get("seq"))
+                        ack_seq = int(data["seq"])
 
                         # track dupe ACKs
                         if self.last_ack is None or ack_seq != self.last_ack:
@@ -68,25 +111,51 @@ class Sender:
                         else:
                             self.dup_ack_count += 1
 
-                        # fast retransmit: on 3 dupe ACKs for same seq
-                        if self.dup_ack_count >= 3 and self.lowest_unacked in self.unacked:
-                            data, _ = self.unacked[self.lowest_unacked]
-                            msg = { "type": "msg", "data": data, "seq": self.lowest_unacked }
-                            self.send(msg)
-                            # reset timer for this packet and reset dupe count
-                            self.unacked[self.lowest_unacked] = (data, time.time())
-                            self.dup_ack_count = 0
+                        # fast retransmit + fast recovery on 3 dupe ACKs
+                        if self.dup_ack_count == 3:
+                            # enter fast recovery, cut the window in half
+                            self.ssthresh = max(int(self.cwnd / 2), 1)
+                            self.cwnd = self.ssthresh + 3
+                            self.in_fast_recovery = True
+                            # retransmit the lost packet right away
+                            if self.lowest_unacked in self.unacked:
+                                pkt_data, _, _ = self.unacked[self.lowest_unacked]
+                                msg = { "type": "msg", "data": pkt_data, "seq": self.lowest_unacked }
+                                self.send(msg)
+                                self.unacked[self.lowest_unacked] = (pkt_data, time.time(), True)
+                        elif self.dup_ack_count > 3 and self.in_fast_recovery:
+                            # inflate window for each additional dupe ack during fast recovery
+                            self.cwnd += 1
 
-                        # everything <= ack_seq is acknowledged
-                        acked = [s for s in self.unacked.keys() if s <= ack_seq]
-                        # remove all acked seq numbers from before the one we just got
-                        # in our unacked list
-                        for s in acked:
-                            self.unacked.pop(s, None)
+                        # new ack that actually advances the window
+                        if ack_seq >= self.lowest_unacked:
+                            # update RTT from this ack, skip retransmitted packets (Karn's algorithm)
+                            if ack_seq in self.unacked:
+                                _, send_time, retransmitted = self.unacked[ack_seq]
+                                if not retransmitted:
+                                    self.update_rtt(send_time)
 
-                        # update the lowest unacked seq number to the next unacked seq number
-                        if ack_seq + 1 > self.lowest_unacked:
-                            self.lowest_unacked = ack_seq + 1
+                            # everything <= ack_seq is acknowledged
+                            acked = [s for s in self.unacked.keys() if s <= ack_seq]
+                            # remove all acked seq numbers from our unacked list
+                            for s in acked:
+                                self.unacked.pop(s, None)
+
+                            # update the lowest unacked seq number to the next one
+                            if ack_seq + 1 > self.lowest_unacked:
+                                self.lowest_unacked = ack_seq + 1
+
+                            # exit fast recovery on new ack, set cwnd back to ssthresh
+                            if self.in_fast_recovery:
+                                self.cwnd = self.ssthresh
+                                self.in_fast_recovery = False
+                            else:
+                                # grow window: slow start doubles, congestion avoidance grows linear
+                                if self.cwnd < self.ssthresh:
+                                    self.cwnd += 1
+                                else:
+                                    self.cwnd += 1.0 / self.cwnd
+
                 elif conn == sys.stdin:
                     data = sys.stdin.read(DATA_SIZE)
                     if len(data) == 0:
@@ -94,26 +163,29 @@ class Sender:
                         continue
 
                     msg = { "type": "msg", "data": data, "seq": self.seq }
-                    self.unacked[self.seq] = (data, time.time())
+                    self.unacked[self.seq] = (data, time.time(), False)
                     self.send(msg)
                     self.seq += 1
 
-
-                # fast retransmission, timeout based
-                if self.unacked:
-                    now = time.time()
-                    if self.lowest_unacked in self.unacked:
-                        _, send_time = self.unacked[self.lowest_unacked]
-                        if now - send_time >= self.rto:
-                            # retransmit all unacked packets with seq >= lowest_unacked
-                            for s in sorted(k for k in self.unacked.keys() if k >= self.lowest_unacked):
-                                data, _ = self.unacked[s]
-                                msg = { "type": "msg", "data": data, "seq": s }
-                                self.send(msg)
-                                self.unacked[s] = (data, now)
-                if self.eof and not self.unacked:
-                    self.log("All done!")
-                    sys.exit(0)
+            # retransmission, timeout based
+            if self.unacked:
+                now = time.time()
+                if self.lowest_unacked in self.unacked:
+                    _, send_time, _ = self.unacked[self.lowest_unacked]
+                    if now - send_time >= self.rto:
+                        # timeout means heavy congestion, go back to slow start
+                        self.ssthresh = max(int(self.cwnd / 2), 1)
+                        self.cwnd = 1
+                        self.in_fast_recovery = False
+                        # retransmit all unacked packets starting from the oldest
+                        for s in sorted(k for k in self.unacked.keys() if k >= self.lowest_unacked):
+                            pkt_data, _, _ = self.unacked[s]
+                            msg = { "type": "msg", "data": pkt_data, "seq": s }
+                            self.send(msg)
+                            self.unacked[s] = (pkt_data, now, True)
+            if self.eof and not self.unacked:
+                self.log("All done!")
+                sys.exit(0)
         return
 
 if __name__ == "__main__":

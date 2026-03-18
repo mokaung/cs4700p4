@@ -1,6 +1,6 @@
 #!/usr/bin/env -S python3 -u
 
-import argparse, socket, time, json, select, struct, sys, math
+import argparse, socket, time, json, select, struct, sys, math, hashlib
 
 class Receiver:
     def __init__(self):
@@ -14,8 +14,14 @@ class Receiver:
         self.remote_host = None
         self.remote_port = None
 
+    def checksum(self, msg):
+        # hash the packet contents so we can detect corruption
+        return hashlib.md5(json.dumps(msg, sort_keys=True).encode("utf-8")).hexdigest()
+
     def send(self, message):
-        self.log("Sent message %s" % json.dumps(message))
+        # attach checksum before sending so sender can verify integrity
+        message["checksum"] = self.checksum(message)
+        self.log("Sent ACK seq=%s" % message.get("seq"))
         self.socket.sendto(json.dumps(message).encode("utf-8"), (self.remote_host, self.remote_port))
 
     def recv(self, socket):
@@ -31,8 +37,24 @@ class Receiver:
             self.log("Error:  Received response from unexpected remote; ignoring")
             return None
         else:
-            self.log("Received message %s" % data.decode("utf-8"))
-            return json.loads(data.decode("utf-8"))
+            self.log("Received message (%d bytes)" % len(data))
+            # try to parse the JSON, drop corrupted packets
+            try:
+                msg = json.loads(data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                self.log("Error:  Received corrupted packet; dropping")
+                return None
+
+            # verify checksum to make sure packet wasnt mangled in transit
+            if "checksum" not in msg:
+                self.log("Error:  Received packet without checksum; dropping")
+                return None
+            received_checksum = msg.pop("checksum")
+            if received_checksum != self.checksum(msg):
+                self.log("Error:  Checksum mismatch on received packet; dropping")
+                return None
+
+            return msg
 
     def log(self, message):
         sys.stderr.write(message + "\n")
@@ -43,11 +65,17 @@ class Receiver:
             socks = select.select([self.socket], [], [])[0]
             for conn in socks:
                 msg = self.recv(conn)
-                ack_seq = 0
 
                 if msg:
+                    # make sure the packet has the fields we need, drop if not
+                    if "seq" not in msg or "data" not in msg:
+                        self.log("Error:  Received malformed packet; dropping")
+                        continue
+
                     seq = msg["seq"]
                     data = msg["data"]
+                    ack_seq = self.exp_seq - 1
+
                     if seq == self.exp_seq:
                         # Print out the data to stdout
                         print(data, end='', flush=True)
@@ -64,27 +92,16 @@ class Receiver:
                         ack_seq = self.exp_seq - 1
                     elif seq > self.exp_seq:
                         # Out of order packet
-                        self.log("Error:  Received packet with sequence number %d, expected %d, therefore I am missing a packet" % (msg["seq"], self.exp_seq))
+                        self.log("Error:  Received packet with sequence number %d, expected %d, therefore I am missing a packet" % (seq, self.exp_seq))
                         if seq not in self.buffer:
                             self.buffer[seq] = data
-
-                        # Send back an ack for the missing packet
-                        ack_seq = self.exp_seq - 1
-                    elif msg["seq"] < self.exp_seq:
+                    elif seq < self.exp_seq:
                         # Duplicate packet
                         self.log("Error:  Received packet with sequence number %d, expected %d, therefore I have received a duplicate packet" % (seq, self.exp_seq))
-                        ack_seq = self.exp_seq - 1
-                    else:
-                        self.log("Error:  Received packet with unexpected sequence number %d" % msg["seq"])
 
-                    # If we have no ack to send, send a 0
-                    if ack_seq < 0:
-                        ack_seq = 0
-                    self.send({ "type": "ack", "seq": ack_seq })
-
-                    
-                    
-
+                    # only send an ack if we have received at least one in-order packet
+                    if ack_seq >= 0:
+                        self.send({ "type": "ack", "seq": ack_seq })
 
         return
 
